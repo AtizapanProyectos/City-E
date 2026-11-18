@@ -4,39 +4,43 @@ from pathlib import Path
 # Rutas base
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Seguridad
-SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-clave-temporal-desarrollo')
-DEBUG = os.environ.get('DEBUG', 'True').lower() in ('true', '1', 't')
+# Environment-based deployment configuration (Railway / local development).
+DEBUG = os.environ.get('DEBUG', 'False').lower() in ('true', '1', 't')
+SECRET_KEY = os.environ.get('SECRET_KEY', '')
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = 'django-insecure-local-development-only'
+    else:
+        from django.core.exceptions import ImproperlyConfigured
+        raise ImproperlyConfigured('Set SECRET_KEY before starting in production.')
 
-ALLOWED_HOSTS = [
-    'city-n-production.up.railway.app',
-    '.railway.app',
-    '.up.railway.app',
-    'localhost',
-    '127.0.0.1',
-    '*',
-]
-allowed_hosts_env = os.environ.get('ALLOWED_HOSTS')
-if allowed_hosts_env:
-    ALLOWED_HOSTS.extend([host.strip() for host in allowed_hosts_env.split(',') if host.strip()])
 
-# Dominios seguros para solicitudes POST / CSRF (Crucial en Railway con HTTPS y dominios personalizados)
-CSRF_TRUSTED_ORIGINS = [
-    'https://city-n-production.up.railway.app',
-    'https://*.railway.app',
-    'https://*.up.railway.app',
-    'http://localhost:8000',
-    'http://127.0.0.1:8000',
-]
-csrf_env = os.environ.get('CSRF_TRUSTED_ORIGINS')
-if csrf_env:
-    CSRF_TRUSTED_ORIGINS.extend([origin.strip() for origin in csrf_env.split(',') if origin.strip()])
+def env_list(name):
+    return [value.strip() for value in os.environ.get(name, '').split(',') if value.strip()]
 
-# Detección de HTTPS detrás del proxy inverso de Railway
+
+ALLOWED_HOSTS = ['localhost', '127.0.0.1'] + env_list('ALLOWED_HOSTS')
+CSRF_TRUSTED_ORIGINS = env_list('CSRF_TRUSTED_ORIGINS')
+railway_domain = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '').strip()
+if railway_domain:
+    ALLOWED_HOSTS.append(railway_domain)
+    CSRF_TRUSTED_ORIGINS.append(f'https://{railway_domain}')
+
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-USE_X_FORWARDED_HOST = True
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+SECURE_SSL_REDIRECT = not DEBUG
+SECURE_HSTS_SECONDS = 3600 if not DEBUG else 0
 
+APP_LOGIN_USER = os.environ.get('APP_LOGIN_USER', '')
+APP_LOGIN_PASSWORD = os.environ.get('APP_LOGIN_PASSWORD', '')
 
+# Keep existing local files; DATA_DIR=/data places mutable files on the Railway volume.
+DATA_DIR = Path(os.environ.get('DATA_DIR', str(BASE_DIR))).resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+ESCUCHA_FILE = DATA_DIR / 'escucha_data.json' if os.environ.get('DATA_DIR') else BASE_DIR / 'maps' / 'escucha_data.json'
+MEDIA_ROOT = DATA_DIR / 'media'
+MEDIA_URL = '/media/'
 
 # Aplicaciones instaladas
 INSTALLED_APPS = [
@@ -86,7 +90,7 @@ WSGI_APPLICATION = 'city_manager.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'NAME': DATA_DIR / 'db.sqlite3',
     }
 }
 

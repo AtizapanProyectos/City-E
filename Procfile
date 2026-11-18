@@ -1,1 +1,1 @@
-web: python manage.py migrate && gunicorn city_manager.wsgi:application --bind 0.0.0.0:$PORT
+web: python manage.py migrate --noinput && python manage.py collectstatic --noinput && exec gunicorn city_manager.wsgi:application --bind 0.0.0.0:$PORT --workers 1 --access-logfile - --error-logfile -

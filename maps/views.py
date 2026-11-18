@@ -1,17 +1,18 @@
 import pandas as pd
 import json
 import os
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from datetime import datetime
-from django.shortcuts import render
+from django.shortcuts import render, redirect
 from django.http import JsonResponse
-from django.db import connection
 from django.db.models import Sum, Avg, Count
 from django.utils import timezone
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import ensure_csrf_cookie
+from django.conf import settings
+from django.utils.crypto import constant_time_compare
 from elections.models import VotacionAyuntamiento, VotacionDiputacion, Promovido, Encuesta
 
-ESCUCHA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'escucha_data.json')
+ESCUCHA_FILE = settings.ESCUCHA_FILE
 
 def safe_float(val):
     try:
@@ -37,16 +38,39 @@ def safe_percentage(val):
     if d > 100: return Decimal('100.0')
     return d
 
+def login_view(request):
+    if request.session.get('autenticado'):
+        return redirect('mapa')
+    error = None
+    if request.method == 'POST':
+        usuario = request.POST.get('usuario', '').strip()
+        password = request.POST.get('password', '').strip()
+        if (settings.APP_LOGIN_USER and settings.APP_LOGIN_PASSWORD
+                and constant_time_compare(usuario, settings.APP_LOGIN_USER)
+                and constant_time_compare(password, settings.APP_LOGIN_PASSWORD)):
+            request.session.cycle_key()
+            request.session['autenticado'] = True
+            request.session['usuario'] = 'administrador'
+            return redirect('mapa')
+        else:
+            error = 'Credenciales incorrectas. Verifica tu usuario y contraseña.'
+    return render(request, 'maps/login.html', {'error': error})
+
+def logout_view(request):
+    request.session.flush()
+    return redirect('login')
+
+@ensure_csrf_cookie
 def mapa_view(request):
+    if not request.session.get('autenticado'):
+        return redirect('login')
     return render(request, 'maps/mapa.html')
 
 def calcular_proyeccion_generica(LN, Vt, historicos, eg_dinamico, Ss=0.6, promovidos_count=0, casillas=0):
     if LN == 0 or Vt == 0: 
         return None
     
-    # REDUCCIÓN DEL 10% APLICADA SOLO A PROYECCIONES
-    FACTOR_PROYECCION = 0.90
-
+    FACTOR_PROYECCION = 0.90  # Reducción conservadora del 10%
     participacion_historica = Vt / LN
     V_esperados = int(LN * participacion_historica)
     Pp = (promovidos_count / LN) if LN > 0 else 0  
@@ -58,8 +82,7 @@ def calcular_proyeccion_generica(LN, Vt, historicos, eg_dinamico, Ss=0.6, promov
     for partido in partidos:
         Vp = safe_float(historicos.get(partido, 0))
         term1 = W1 * (Vp / Vt) 
-        
-        if partido == 'pan':
+        if partido == 'pri':
             term2 = W2 * ((Pp * LN) / V_esperados) if V_esperados > 0 else 0
             Eg_actual = safe_float(eg_dinamico.get(partido, 0))
             if Eg_actual == 0: Eg_actual = 0.35
@@ -71,13 +94,10 @@ def calcular_proyeccion_generica(LN, Vt, historicos, eg_dinamico, Ss=0.6, promov
                 term3 = W3 * (Eg_actual * 1.0)
             else:
                 term3 = W3 * (Vp / Vt) * 1.0 
-        
         fuerza_bruta[partido] = term1 + term2 + term3
     
     total_fuerza = sum(fuerza_bruta.values())
     proyecciones = {}
-    
-    # Reducción matemática general a votos y participación
     V_esperados_reducidos = int(V_esperados * FACTOR_PROYECCION)
     
     for partido in partidos:
@@ -99,7 +119,6 @@ def calcular_proyeccion_generica(LN, Vt, historicos, eg_dinamico, Ss=0.6, promov
         proyecciones['participacion'] = 0
         proyecciones['lista_nominal'] = LN
         proyecciones['casillas'] = casillas
-        
     return proyecciones
 
 def obtener_datos_seccion(request, num_seccion):
@@ -116,17 +135,21 @@ def obtener_datos_seccion(request, num_seccion):
 
         def serializar_modelo(obj):
             if not obj: return None
+            ln = safe_float(obj.lista_nominal)
+            vv = safe_float(obj.num_votos_validos)
+            historicos = { p: getattr(obj, p, 0) for p in ['pan', 'pri', 'prd', 'pvem', 'pt', 'mc', 'morena', 'naem'] }
+            ganador_real = str(obj.partido_ganador).strip().upper() if obj.partido_ganador else ''
+            if not ganador_real or ganador_real == 'N/A':
+                ganador_real = max(historicos, key=historicos.get).upper() if sum(historicos.values()) > 0 else 'N/A'
+
             datos = {
                 'casillas': obj.casillas, 'lista_nominal': obj.lista_nominal,
                 'num_votos_validos': obj.num_votos_validos, 'participacion': safe_float(obj.participacion),
                 'pan': obj.pan, 'pri': obj.pri, 'prd': obj.prd, 'pvem': obj.pvem, 'pt': obj.pt,
-                'mc': obj.mc, 'morena': obj.morena, 'naem': obj.naem, 
-                'ganador': str(obj.partido_ganador).upper() if obj.partido_ganador else 'N/A'
+                'mc': obj.mc, 'morena': obj.morena, 'naem': obj.naem, 'ganador': ganador_real
             }
-            historicos = { p: getattr(obj, p, 0) for p in ['pan', 'pri', 'prd', 'pvem', 'pt', 'mc', 'morena', 'naem'] }
             datos['proyeccion'] = calcular_proyeccion_generica(
-                obj.lista_nominal, obj.num_votos_validos, historicos, eg_dinamico, 
-                Ss=factor_escucha, promovidos_count=promovidos_count, casillas=obj.casillas
+                ln, vv, historicos, eg_dinamico, Ss=factor_escucha, promovidos_count=promovidos_count, casillas=obj.casillas
             )
             return datos
 
@@ -141,7 +164,6 @@ def obtener_datos_seccion(request, num_seccion):
 def obtener_datos_totales(request):
     try:
         factor_escucha = safe_float(request.GET.get('factor_escucha', 0.6))
-        
         promovidos_por_seccion = {
             item['seccion_electoral']: item['total'] 
             for item in Promovido.objects.values('seccion_electoral').annotate(total=Count('id')) 
@@ -164,7 +186,6 @@ def obtener_datos_totales(request):
             lista_nom = safe_float(totales['lista_nominal'])
             votos_val = safe_float(totales['num_votos_validos'])
             participacion = (votos_val / lista_nom * 100) if lista_nom > 0 else 0
-            
             votos_partidos = { 'pan': totales['pan'], 'pri': totales['pri'], 'prd': totales['prd'], 'pvem': totales['pvem'], 'pt': totales['pt'], 'mc': totales['mc'], 'morena': totales['morena'], 'naem': totales['naem'] }
             ganador = max(votos_partidos, key=votos_partidos.get).upper() if sum(votos_partidos.values()) > 0 else 'N/A'
 
@@ -180,57 +201,52 @@ def obtener_datos_totales(request):
             )
             return datos
 
-        secciones_ayto = VotacionAyuntamiento.objects.all()
-        ganadores_map = {}
-        proyectados_map = {}
-        
-        for s in secciones_ayto:
-            sec_str = str(s.seccion)
-            historicos = { p: getattr(s, p, 0) for p in ['pan', 'pri', 'prd', 'pvem', 'pt', 'mc', 'morena', 'naem'] }
-            
-            votos_validos = s.num_votos_validos if s.num_votos_validos else sum(historicos.values())
-            ganador_hist = str(s.partido_ganador).upper() if s.partido_ganador else 'N/A'
-            pct_hist = 0
-            if ganador_hist != 'N/A' and ganador_hist.lower() in historicos and votos_validos > 0:
-                pct_hist = (safe_float(historicos[ganador_hist.lower()]) / safe_float(votos_validos)) * 100
-            
-            ganadores_map[sec_str] = {
-                'partido': ganador_hist,
-                'porcentaje': pct_hist
-            }
-            
-            proy = calcular_proyeccion_generica(
-                s.lista_nominal, s.num_votos_validos, historicos, eg_dinamico, 
-                Ss=factor_escucha, promovidos_count=promovidos_por_seccion.get(s.seccion, 0), casillas=s.casillas
-            )
-            
-            if proy and proy.get('ganador') and proy['ganador'] != 'N/A':
-                ganador_proy = proy['ganador']
-                total_proy = sum([proy.get(p, 0) for p in ['pan', 'pri', 'prd', 'pvem', 'pt', 'mc', 'morena', 'naem']])
-                pct_proy = (proy.get(ganador_proy.lower(), 0) / total_proy * 100) if total_proy > 0 else 0
+        def construir_mapas_secciones(modelo):
+            registros = modelo.objects.all()
+            hist_map = {}
+            proy_map = {}
+            partidos_list = ['pan', 'pri', 'prd', 'pvem', 'pt', 'mc', 'morena', 'naem']
+            for s in registros:
+                sec_str = str(s.seccion)
+                historicos = { p: safe_float(getattr(s, p, 0)) for p in partidos_list }
+                suma_partidos = sum(historicos.values())
+                votos_validos = safe_float(s.num_votos_validos) if s.num_votos_validos else suma_partidos
+                ganador_hist = str(s.partido_ganador).strip().upper() if s.partido_ganador else ''
+                if not ganador_hist or ganador_hist == 'N/A' or ganador_hist.lower() not in historicos:
+                    ganador_hist = max(historicos, key=historicos.get).upper() if suma_partidos > 0 else 'N/A'
+                pct_hist = (historicos[ganador_hist.lower()] / votos_validos) * 100 if (ganador_hist != 'N/A' and ganador_hist.lower() in historicos and votos_validos > 0) else 0
+                hist_map[sec_str] = { 'partido': ganador_hist, 'porcentaje': round(pct_hist, 2) }
                 
-                proyectados_map[sec_str] = {
-                    'partido': ganador_proy,
-                    'porcentaje': pct_proy
-                }
-            else:
-                proyectados_map[sec_str] = {'partido': 'N/A', 'porcentaje': 0}
+                proy = calcular_proyeccion_generica(
+                    safe_float(s.lista_nominal), votos_validos, historicos, eg_dinamico, 
+                    Ss=factor_escucha, promovidos_count=promovidos_por_seccion.get(s.seccion, 0), casillas=s.casillas
+                )
+                if proy and proy.get('ganador') and proy['ganador'] != 'N/A':
+                    ganador_proy = proy['ganador']
+                    total_proy = sum([proy.get(p, 0) for p in partidos_list])
+                    pct_proy = (proy.get(ganador_proy.lower(), 0) / total_proy * 100) if total_proy > 0 else 0
+                    proy_map[sec_str] = { 'partido': ganador_proy, 'porcentaje': round(pct_proy, 2) }
+                else:
+                    proy_map[sec_str] = {'partido': 'N/A', 'porcentaje': 0}
+            return hist_map, proy_map
+
+        hist_ayto, proy_ayto = construir_mapas_secciones(VotacionAyuntamiento)
+        hist_dip, proy_dip = construir_mapas_secciones(VotacionDiputacion)
 
         return JsonResponse({
             'ayuntamiento': get_totales(VotacionAyuntamiento), 
             'diputacion': get_totales(VotacionDiputacion),
-            'ganadores_historicos': ganadores_map,
-            'ganadores_proyectados': proyectados_map
+            'ganadores_historicos': { 'ayuntamiento': hist_ayto, 'diputacion': hist_dip },
+            'ganadores_proyectados': { 'ayuntamiento': proy_ayto, 'diputacion': proy_dip }
         })
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
 
-@csrf_exempt
 def procesar_escucha_social(request):
     if request.method == 'POST':
         archivos = request.FILES.getlist('files')
-        if len(archivos) != 2:
-            return JsonResponse({'error': 'Debe adjuntar exactamente 2 reportes para la comparativa.'}, status=400)
+        if len(archivos) != 3:
+            return JsonResponse({'error': 'Debe adjuntar exactamente 3 reportes Excel para la comparativa.'}, status=400)
         
         resultados = []
         factor_calculado = 0.6 
@@ -265,15 +281,17 @@ def procesar_escucha_social(request):
                     'total_menciones': total_menciones 
                 })
             except Exception as e:
-                return JsonResponse({'error': 'Error al procesar archivo.'}, status=400)
+                return JsonResponse({'error': f'Error al procesar archivo {f.name}: {str(e)}'}, status=400)
         
         if len(resultados) > 0:
             factor_calculado = resultados[0]['factor_sentimiento']
+            
         datos_guardar = {'data': resultados, 'factor_global': factor_calculado}
         try:
             with open(ESCUCHA_FILE, 'w', encoding='utf-8') as f:
                 json.dump(datos_guardar, f)
-        except Exception: pass
+        except OSError:
+            return JsonResponse({'error': 'No se pudo guardar la escucha social en el almacenamiento persistente.'}, status=500)
         return JsonResponse({'status': 'ok', 'data': resultados, 'factor_global': factor_calculado})
     return JsonResponse({'error': 'Método no permitido'}, status=400)
 
@@ -297,7 +315,6 @@ def listar_promovidos(request):
     } for p in promovidos]
     return JsonResponse(data, safe=False)
 
-@csrf_exempt
 def cargar_promovidos(request):
     if request.method == 'POST' and request.FILES.get('file'):
         try:
@@ -323,83 +340,83 @@ def cargar_promovidos(request):
                     )
                     if created: creados += 1
                 except Exception: continue
-            return JsonResponse({'status': 'ok', 'mensaje': f'Se procesaron correctamente los datos. Nuevos: {creados}'})
+            return JsonResponse({'status': 'ok', 'mensaje': f'Se procesaron correctamente. Nuevos: {creados}'})
         except Exception as e: return JsonResponse({'error': str(e)}, status=400)
     return JsonResponse({'error': 'No se envió ningún archivo'}, status=400)
 
-@csrf_exempt
+def guardar_promovido(request):
+    if request.method != 'POST': return JsonResponse({'status': 'error', 'msg': 'Método no permitido'}, status=405)
+    try:
+        nombre = str(request.POST.get('nombre_completo', '')).strip()
+        telefono = str(request.POST.get('telefono_movil', '')).strip()
+        correo = str(request.POST.get('correo_electronico', '')).strip()
+        red_social = str(request.POST.get('red_social', '')).strip()
+        direccion = str(request.POST.get('direccion_completa', '')).strip()
+        seccion_raw = request.POST.get('seccion_electoral', '')
+        distrito = str(request.POST.get('distrito_zona', '')).strip()
+        confirma = str(request.POST.get('confirma_apoyo', 'Sí')).strip()
+        medio = str(request.POST.get('medio_contacto', 'Trabajo de Campo')).strip()
+        responsable = str(request.POST.get('responsable_captura', '')).strip()
+        estatus = str(request.POST.get('estatus', '')).strip()
+
+        if not nombre: return JsonResponse({'status': 'error', 'msg': 'El nombre completo es obligatorio.'}, status=400)
+        seccion_val = int(seccion_raw) if (seccion_raw and str(seccion_raw).strip().isdigit()) else None
+
+        if not estatus:
+            if confirma == 'Sí': estatus = 'Confirmado'
+            elif confirma == 'No': estatus = 'Inalcanzable'
+            else: estatus = 'Por visitar'
+
+        nuevo = Promovido.objects.create(
+            nombre_completo=nombre, telefono_movil=telefono, correo_electronico=correo if correo else None,
+            facebook=red_social if red_social else None, direccion_completa=direccion, seccion_electoral=seccion_val,
+            distrito_zona=distrito, confirma_apoyo=confirma[:2] if confirma else 'Sí', medio_contacto=medio,
+            responsable_captura=responsable, fecha_registro=timezone.now().date(), estatus=estatus
+        )
+        return JsonResponse({'status': 'ok', 'id': nuevo.id})
+    except Exception as e: return JsonResponse({'status': 'error', 'msg': str(e)}, status=500)
+
+def reiniciar_promovidos(request):
+    if request.method != 'POST': return JsonResponse({'status': 'error', 'msg': 'Método no permitido'}, status=405)
+    try:
+        total_eliminados, _ = Promovido.objects.all().delete()
+        return JsonResponse({'status': 'ok', 'eliminados': total_eliminados})
+    except Exception as e: return JsonResponse({'status': 'error', 'msg': str(e)}, status=500)
+
 def guardar_encuesta(request):
-    if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'msg': 'Método no permitido'})
+    if request.method != 'POST': return JsonResponse({'status': 'error', 'msg': 'Método no permitido'})
     try:
         enc_id = request.POST.get('id')
-        casa = str(request.POST.get('casa_encuestadora', '')).strip()[:150]
-        if not casa:
-            casa = 'General'
-
+        casa = str(request.POST.get('casa_encuestadora', '')).strip()[:150] or 'General'
         defaults = {
             'casa_encuestadora': casa,
-            'pan': safe_percentage(request.POST.get('pan')),
-            'pri': safe_percentage(request.POST.get('pri')),
-            'prd': safe_percentage(request.POST.get('prd')),
-            'pvem': safe_percentage(request.POST.get('pvem')),
-            'pt': safe_percentage(request.POST.get('pt')),
-            'mc': safe_percentage(request.POST.get('mc')),
-            'morena': safe_percentage(request.POST.get('morena')),
-            'naem': safe_percentage(request.POST.get('naem')),
+            'pan': safe_percentage(request.POST.get('pan')), 'pri': safe_percentage(request.POST.get('pri')),
+            'prd': safe_percentage(request.POST.get('prd')), 'pvem': safe_percentage(request.POST.get('pvem')),
+            'pt': safe_percentage(request.POST.get('pt')), 'mc': safe_percentage(request.POST.get('mc')),
+            'morena': safe_percentage(request.POST.get('morena')), 'naem': safe_percentage(request.POST.get('naem')),
             'indecisos': safe_percentage(request.POST.get('indecisos')),
         }
-
         if enc_id and str(enc_id).strip() != '':
-            actualizadas = Encuesta.objects.filter(id=enc_id).update(**defaults)
-            if actualizadas == 0:
-                return JsonResponse({'status': 'error', 'msg': 'La encuesta que intentas editar ya no existe.'})
+            Encuesta.objects.filter(id=enc_id).update(**defaults)
         else:
             defaults['fecha_registro'] = timezone.now()
             Encuesta.objects.create(**defaults)
-
         return JsonResponse({'status': 'ok'})
-    except Exception as e:
-        return JsonResponse({'status': 'error', 'msg': str(e)})
+    except Exception as e: return JsonResponse({'status': 'error', 'msg': str(e)})
 
-@csrf_exempt
 def eliminar_encuesta(request):
-    if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'msg': 'Método no permitido'})
+    if request.method != 'POST': return JsonResponse({'status': 'error', 'msg': 'Método no permitido'})
     try:
-        enc_id = request.POST.get('id')
-        if not enc_id:
-            return JsonResponse({'status': 'error', 'msg': 'No se recibió el identificador de la encuesta.'})
-        eliminadas, _ = Encuesta.objects.filter(id=enc_id).delete()
-        if eliminadas == 0:
-            return JsonResponse({'status': 'error', 'msg': 'La encuesta ya no existe (probablemente ya fue eliminada).'})
+        Encuesta.objects.filter(id=request.POST.get('id')).delete()
         return JsonResponse({'status': 'ok'})
-    except Exception as e:
-        return JsonResponse({'status': 'error', 'msg': str(e)})
+    except Exception as e: return JsonResponse({'status': 'error', 'msg': str(e)})
 
-@csrf_exempt
 def reiniciar_encuestas(request):
-    if request.method != 'POST':
-        return JsonResponse({'status': 'error', 'msg': 'Método no permitido'}, status=405)
+    if request.method != 'POST': return JsonResponse({'status': 'error', 'msg': 'Método no permitido'}, status=405)
     try:
-        total_eliminadas, _ = Encuesta.objects.all().delete()
-        table_name = Encuesta._meta.db_table
-        vendor = connection.vendor
-        
-        try:
-            with connection.cursor() as cursor:
-                if vendor == 'postgresql':
-                    cursor.execute(f'ALTER SEQUENCE "{table_name}_id_seq" RESTART WITH 1;')
-                elif vendor == 'mysql':
-                    cursor.execute(f'ALTER TABLE `{table_name}` AUTO_INCREMENT = 1;')
-                elif vendor == 'sqlite':
-                    cursor.execute("DELETE FROM sqlite_sequence WHERE name = %s;", [table_name])
-        except Exception:
-            pass 
-            
-        return JsonResponse({'status': 'ok', 'eliminadas': total_eliminadas})
-    except Exception as e:
-        return JsonResponse({'status': 'error', 'msg': str(e)}, status=500)
+        total, _ = Encuesta.objects.all().delete()
+        return JsonResponse({'status': 'ok', 'eliminadas': total})
+    except Exception as e: return JsonResponse({'status': 'error', 'msg': str(e)}, status=500)
 
 def obtener_promedio_encuestas(request):
     try:
@@ -413,20 +430,15 @@ def obtener_promedio_encuestas(request):
             'pt': safe_float(promedios['pt__avg']), 'mc': safe_float(promedios['mc__avg']), 'morena': safe_float(promedios['morena__avg']), 'naem': safe_float(promedios['naem__avg']),
             'indecisos': safe_float(promedios['indecisos__avg'])
         })
-    except Exception:
-        return JsonResponse({'error': 'Error interno'}, status=500)
+    except Exception: return JsonResponse({'error': 'Error interno'}, status=500)
 
 def historial_encuestas(request):
     try:
         encuestas = Encuesta.objects.all().order_by('-id')
         data = [{
-            'id': e.id, 
-            'fecha': e.fecha_registro.strftime('%d/%m/%Y') if e.fecha_registro else '-', 
-            'casa': e.casa_encuestadora,
-            'pan': safe_float(e.pan), 'pri': safe_float(e.pri), 'prd': safe_float(e.prd), 
-            'pvem': safe_float(e.pvem), 'pt': safe_float(e.pt), 'mc': safe_float(e.mc),
-            'morena': safe_float(e.morena), 'naem': safe_float(e.naem), 'indecisos': safe_float(e.indecisos)
+            'id': e.id, 'fecha': e.fecha_registro.strftime('%d/%m/%Y') if e.fecha_registro else '-', 'casa': e.casa_encuestadora,
+            'pan': safe_float(e.pan), 'pri': safe_float(e.pri), 'prd': safe_float(e.prd), 'pvem': safe_float(e.pvem), 
+            'pt': safe_float(e.pt), 'mc': safe_float(e.mc), 'morena': safe_float(e.morena), 'naem': safe_float(e.naem), 'indecisos': safe_float(e.indecisos)
         } for e in encuestas]
         return JsonResponse(data, safe=False)
-    except Exception as e:
-        return JsonResponse([], safe=False)
+    except Exception as e: return JsonResponse([], safe=False)
